@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Body, Bytes};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -39,13 +39,12 @@ fn init_store() -> Result<FileStore> {
     std::fs::read_dir("./store")?
         .flatten()
         .filter(|e| !e.metadata().unwrap().is_dir())
-        .map(|file: std::fs::DirEntry| -> Result<File> {
+        .flat_map(|file: std::fs::DirEntry| -> Result<File> {
             Ok(File {
                 name: file.file_name().to_str().unwrap().to_string(),
                 content: String::from_utf8(std::fs::read(file.path())?).ok(),
             })
         })
-        .flatten()
         .for_each(move |file| {
             lock.insert(file.name.clone(), file);
         });
@@ -74,11 +73,22 @@ async fn response_handler(
     req: Request<hyper::body::Incoming>,
     db_handle: FileStore,
 ) -> Result<Response<BoxBody<Bytes, std::io::Error>>> {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/files") => all(db_handle).await,
-        (&Method::POST, "/file") => upload(req, db_handle).await,
-        // TODO: this does not work..., needs a fix, idk how to yet tho
-        (&Method::GET, "/file/") => download(req, db_handle).await,
+    let path = req
+        .uri()
+        .path()
+        .split("/")
+        .filter(|e| !e.is_empty())
+        .collect::<Vec<&str>>();
+
+    match (req.method(), path[0]) {
+        (&Method::GET, "files") => all(db_handle).await,
+        (&Method::POST, "file") => upload(req, db_handle).await,
+        (&Method::GET, "file") => {
+            if path.get(1).is_none() {
+                return response(StatusCode::NOT_FOUND, "No file path");
+            }
+            download(db_handle, path[1]).await
+        }
         _ => response(StatusCode::NOT_FOUND, "Not Found"),
     }
 }
@@ -121,23 +131,26 @@ async fn upload(
 }
 
 async fn download(
-    req: Request<hyper::body::Incoming>,
     db_handle: FileStore,
+    file_name: &str,
 ) -> Result<Response<BoxBody<Bytes, std::io::Error>>> {
-    dbg!(req.uri().path().split("/"));
-    let file_name = match req.uri().path().split("/").last() {
-        Some(str) => str,
-        None => return response(StatusCode::BAD_REQUEST, "No file path given"),
-    };
-
     // edge case if only /file is called
     if file_name == "file" {
         return response(StatusCode::BAD_REQUEST, "No file path given");
     }
 
-    let handle = db_handle.lock().unwrap();
-    if let Some(file) = handle.get(file_name) {
-        todo!("return file here")
+    let mut file_name = file_name;
+
+    // anti path traversal
+    if let Some(base) = Path::new(file_name).file_name() {
+        file_name = base.to_str().unwrap();
+    }
+
+    let lock = db_handle.lock().unwrap();
+    if let Some(file) = lock.get(file_name) {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(full(file.content.clone().unwrap_or_default()))?);
     }
 
     response(
@@ -187,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await
             .context("Failed to await stream accepting")?;
 
+        let addr = stream.peer_addr()?;
         let io = TokioIo::new(stream);
         let db_handle = db.clone();
 
@@ -195,13 +209,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .serve_connection(
                     io,
                     service_fn(move |req| {
-                        let method = (&req).method().clone();
-                        let path = (&req).uri().path().to_string();
+                        let method = req.method().to_string();
+                        let path = req.uri().path().to_string();
                         let res = response_handler(req, Arc::clone(&db_handle));
                         async move {
                             let r = res.await;
                             if let Ok(ok) = &r {
-                                println!("| {} | [{}] '{}' ", ok.status().as_u16(), method, path);
+                                println!(
+                                    "|{: ^5}|{: ^7}| {: <25} | {: >4}b | {}",
+                                    ok.status().as_u16(),
+                                    method,
+                                    path,
+                                    ok.body().size_hint().exact().unwrap_or(0),
+                                    addr,
+                                );
                             }
                             r
                         }

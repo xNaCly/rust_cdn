@@ -115,7 +115,16 @@ async fn upload(
         content: { Some(params.get("content").unwrap_or(&String::from("")).clone()) },
     };
     let mut lock = db_handle.lock().unwrap();
-    let filename = file.name.clone();
+
+    let filename;
+    if let Some(base) = Path::new(&file.name).file_name() {
+        filename = base.to_str().unwrap().to_string();
+    } else {
+        return response(
+            StatusCode::BAD_REQUEST,
+            &format!("Failed to store file with bad path '{}'", &file.name),
+        );
+    };
 
     std::fs::write(
         Path::new(".").join("store").join(&filename),
@@ -139,15 +148,18 @@ async fn download(
         return response(StatusCode::BAD_REQUEST, "No file path given");
     }
 
-    let mut file_name = file_name;
-
-    // anti path traversal
+    let filename;
     if let Some(base) = Path::new(file_name).file_name() {
-        file_name = base.to_str().unwrap();
-    }
+        filename = base.to_str().unwrap().to_string();
+    } else {
+        return response(
+            StatusCode::BAD_REQUEST,
+            &format!("Failed to load file with bad path '{}'", file_name),
+        );
+    };
 
     let lock = db_handle.lock().unwrap();
-    if let Some(file) = lock.get(file_name) {
+    if let Some(file) = lock.get(&filename) {
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .body(full(file.content.clone().unwrap_or_default()))?);
